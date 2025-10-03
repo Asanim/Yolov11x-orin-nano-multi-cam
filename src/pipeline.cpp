@@ -2,6 +2,7 @@
 #include <iostream>
 #include <chrono>
 #include <iomanip>
+#include <set>
 
 Pipeline::Pipeline(const std::string& enginePath, nvinfer1::ILogger& logger)
     : running_(false) {
@@ -184,6 +185,11 @@ bool Pipeline::inferMultiCamera(const std::vector<int>& cameraIndices, int fps) 
         std::cout << GREEN_COLOR << "Starting multi-camera inference with " 
                   << cameras_.size() << " cameras at " << fps << " FPS" << RESET_COLOR << std::endl;
         
+        // Optimize camera settings for low latency
+        for (auto& camera : cameras_) {
+            optimizeCamera(camera);
+        }
+        
         // Start frame grabber threads
         for (size_t i = 0; i < cameraIndices.size(); ++i) {
             if (i < cameras_.size()) {
@@ -191,8 +197,11 @@ bool Pipeline::inferMultiCamera(const std::vector<int>& cameraIndices, int fps) 
             }
         }
         
-        // Start inference thread
-        inferenceThread_ = std::thread(&Pipeline::inferenceThread, this);
+        // Start multiple inference threads for parallel processing
+        inferenceThreads_.reserve(NUM_INFERENCE_THREADS);
+        for (int i = 0; i < NUM_INFERENCE_THREADS; ++i) {
+            inferenceThreads_.emplace_back(&Pipeline::inferenceThread, this, i);
+        }
         
         // Start display thread
         displayThread_ = std::thread(&Pipeline::displayThread, this);
@@ -224,8 +233,10 @@ void Pipeline::stop() {
         }
     }
     
-    if (inferenceThread_.joinable()) {
-        inferenceThread_.join();
+    for (auto& thread : inferenceThreads_) {
+        if (thread.joinable()) {
+            thread.join();
+        }
     }
     
     if (displayThread_.joinable()) {
@@ -240,6 +251,7 @@ void Pipeline::stop() {
     }
     cameras_.clear();
     grabberThreads_.clear();
+    inferenceThreads_.clear();
     
     cv::destroyAllWindows();
 }
@@ -263,18 +275,17 @@ void Pipeline::frameGrabberThread(int cameraId, int targetFps) {
             cv::Mat frame;
             if (cameras_[cameraIndex].read(frame) && !frame.empty()) {
                 CameraFrame cameraFrame;
-                cameraFrame.frame = frame.clone();
+                cameraFrame.frame = std::move(frame); // Use move semantics to avoid copying
                 cameraFrame.cameraId = cameraId;
                 cameraFrame.timestamp = std::chrono::steady_clock::now();
                 
                 {
                     std::lock_guard<std::mutex> lock(frameQueueMutex_);
-                    frameQueue_.push(cameraFrame);
-                    
-                    // Limit queue size to prevent memory issues
-                    while (frameQueue_.size() > 10) {
+                    // Drop old frames if queue is full for low latency
+                    while (frameQueue_.size() >= MAX_QUEUE_SIZE) {
                         frameQueue_.pop();
                     }
+                    frameQueue_.push(std::move(cameraFrame));
                 }
             }
         }
@@ -285,29 +296,23 @@ void Pipeline::frameGrabberThread(int cameraId, int targetFps) {
     }
 }
 
-void Pipeline::inferenceThread() {
+void Pipeline::inferenceThread(int threadId) {
     while (running_) {
         CameraFrame cameraFrame;
-        bool hasFrame = false;
         
-        {
-            std::lock_guard<std::mutex> lock(frameQueueMutex_);
-            if (!frameQueue_.empty()) {
-                cameraFrame = frameQueue_.front();
-                frameQueue_.pop();
-                hasFrame = true;
-            }
-        }
-        
-        if (hasFrame) {
+        if (tryPopFrame(cameraFrame)) {
             processFrame(cameraFrame);
         } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            // Use shorter sleep for better responsiveness
+            std::this_thread::sleep_for(std::chrono::microseconds(PipelineConfig::INFERENCE_THREAD_SLEEP_US));
         }
     }
 }
 
 void Pipeline::displayThread() {
+    // Create windows once at startup for better performance
+    std::set<int> createdWindows;
+    
     while (running_) {
         std::pair<cv::Mat, int> result;
         bool hasResult = false;
@@ -315,7 +320,7 @@ void Pipeline::displayThread() {
         {
             std::lock_guard<std::mutex> lock(resultQueueMutex_);
             if (!resultQueue_.empty()) {
-                result = resultQueue_.front();
+                result = std::move(resultQueue_.front());
                 resultQueue_.pop();
                 hasResult = true;
             }
@@ -323,17 +328,29 @@ void Pipeline::displayThread() {
         
         if (hasResult) {
             std::string windowName = getWindowName(result.second);
+            
+            // Create window only once per camera
+            if (createdWindows.find(result.second) == createdWindows.end()) {
+                cv::namedWindow(windowName, cv::WINDOW_AUTOSIZE);
+                createdWindows.insert(result.second);
+            }
+            
             cv::imshow(windowName, result.first);
         } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            // Shorter sleep for better responsiveness
+            std::this_thread::sleep_for(std::chrono::microseconds(PipelineConfig::DISPLAY_THREAD_SLEEP_US));
         }
+        
+        // Process window events more frequently
+        cv::waitKey(1);
     }
 }
 
 void Pipeline::processFrame(const CameraFrame& cameraFrame) {
     try {
         auto processStart = std::chrono::steady_clock::now();
-        cv::Mat frame = cameraFrame.frame.clone();
+        // Use reference to avoid copying - the frame will be moved later
+        cv::Mat& frame = const_cast<cv::Mat&>(cameraFrame.frame);
         
         auto preprocessStart = std::chrono::steady_clock::now();
         // Preprocess the frame
@@ -346,8 +363,9 @@ void Pipeline::processFrame(const CameraFrame& cameraFrame) {
         auto inferenceEnd = std::chrono::steady_clock::now();
         
         auto postprocessStart = std::chrono::steady_clock::now();
-        // Postprocess to get detections
+        // Postprocess to get detections - preallocate for better performance
         std::vector<Detection> detections;
+        detections.reserve(PipelineConfig::DETECTION_VECTOR_RESERVE);
         yolov11_->postprocess(detections);
         auto postprocessEnd = std::chrono::steady_clock::now();
         
@@ -372,16 +390,8 @@ void Pipeline::processFrame(const CameraFrame& cameraFrame) {
                   << ", overall FPS: " << (1000.0 / totalProcessTime) << "Hz"
                   << RESET_COLOR << std::endl;
 
-        // Add frame to result queue
-        {
-            std::lock_guard<std::mutex> lock(resultQueueMutex_);
-            resultQueue_.push({frame, cameraFrame.cameraId});
-            
-            // Limit queue size
-            while (resultQueue_.size() > 5) {
-                resultQueue_.pop();
-            }
-        }
+        // Add frame to result queue using move semantics
+        pushResult(std::move(frame), cameraFrame.cameraId);
     }
     catch (const std::exception& e) {
         std::cerr << RED_COLOR << "Error processing frame from camera " 
@@ -391,4 +401,41 @@ void Pipeline::processFrame(const CameraFrame& cameraFrame) {
 
 std::string Pipeline::getWindowName(int cameraId) {
     return "Camera " + std::to_string(cameraId) + " - YOLOv11 Inference";
+}
+
+// Performance optimization functions
+bool Pipeline::tryPopFrame(CameraFrame& frame) {
+    std::lock_guard<std::mutex> lock(frameQueueMutex_);
+    if (!frameQueue_.empty()) {
+        frame = std::move(frameQueue_.front());
+        frameQueue_.pop();
+        return true;
+    }
+    return false;
+}
+
+void Pipeline::pushResult(cv::Mat&& frame, int cameraId) {
+    std::lock_guard<std::mutex> lock(resultQueueMutex_);
+    // Drop old results if queue is full for low latency
+    while (resultQueue_.size() >= PipelineConfig::MAX_RESULT_QUEUE_SIZE) {
+        resultQueue_.pop();
+    }
+    resultQueue_.push({std::move(frame), cameraId});
+}
+
+void Pipeline::optimizeCamera(cv::VideoCapture& cap) {
+    // Set camera properties for optimal performance and low latency
+    cap.set(cv::CAP_PROP_BUFFERSIZE, PipelineConfig::CAMERA_BUFFER_SIZE);
+    cap.set(cv::CAP_PROP_FPS, PipelineConfig::DEFAULT_CAMERA_FPS);
+    
+    // Try to enable hardware acceleration if available
+    cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+    
+    // Set optimal resolution
+    cap.set(cv::CAP_PROP_FRAME_WIDTH, PipelineConfig::CAMERA_WIDTH);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, PipelineConfig::CAMERA_HEIGHT);
+    
+    // Disable auto-exposure and auto-focus for consistent performance
+    cap.set(cv::CAP_PROP_AUTO_EXPOSURE, 0.25); // Manual exposure
+    cap.set(cv::CAP_PROP_AUTOFOCUS, 0);        // Disable autofocus
 }
