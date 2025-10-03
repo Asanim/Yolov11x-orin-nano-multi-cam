@@ -367,8 +367,11 @@ void Pipeline::processFrame(const CameraFrame& cameraFrame) {
         std::cout << GREEN_COLOR << "Cam " << cameraFrame.cameraId 
                   << " - Delay: " << captureDelay << "ms"
                   << ", Inference: " << std::fixed << std::setprecision(2) << inferenceTime << "ms"
-                  << ", Total: " << totalProcessTime << "ms" << RESET_COLOR << std::endl;
-        
+                  << ", Total: " << totalProcessTime << "ms" 
+                  << ", inference FPS: " << (1000.0 / inferenceTime) << "Hz"
+                  << ", overall FPS: " << (1000.0 / totalProcessTime) << "Hz"
+                  << RESET_COLOR << std::endl;
+
         // Add frame to result queue
         {
             std::lock_guard<std::mutex> lock(resultQueueMutex_);

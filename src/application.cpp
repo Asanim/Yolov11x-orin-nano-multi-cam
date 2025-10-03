@@ -86,7 +86,7 @@ std::vector<int> Application::enumerateUsbCameras() {
     printColoredText("Enumerating USB cameras...", GREEN_COLOR);
     
     // Test camera indices from 0 to 9
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 24; ++i) {
         cv::VideoCapture cap(i);
         if (cap.isOpened()) {
             // Try to read a frame to confirm the camera is working
