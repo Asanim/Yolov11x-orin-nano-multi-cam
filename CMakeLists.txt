@@ -45,6 +45,8 @@ set(SOURCES
     main.cpp
     src/yolov11.cpp
     src/preprocess.cu
+    src/application.cpp
+    src/pipeline.cpp
 )
 
 # Create executable (CMake handles CUDA sources automatically)
