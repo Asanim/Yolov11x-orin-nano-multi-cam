@@ -3,10 +3,18 @@
 #include <chrono>
 #include <iomanip>
 #include <set>
+#include <pthread.h>  // For thread priorities
+#include <sched.h>    // For CPU affinity
 
 Pipeline::Pipeline(const std::string& enginePath, nvinfer1::ILogger& logger)
     : running_(false) {
     yolov11_ = std::make_unique<YOLOv11>(enginePath, logger);
+    
+    // Create multiple YOLO instances for parallel inference
+    yolov11_instances_.reserve(NUM_INFERENCE_THREADS);
+    for (int i = 0; i < NUM_INFERENCE_THREADS; ++i) {
+        yolov11_instances_.push_back(yolov11_->createThreadInstance());
+    }
 }
 
 Pipeline::~Pipeline() {
@@ -301,7 +309,7 @@ void Pipeline::inferenceThread(int threadId) {
         CameraFrame cameraFrame;
         
         if (tryPopFrame(cameraFrame)) {
-            processFrame(cameraFrame);
+            processFrame(cameraFrame, threadId);
         } else {
             // Use shorter sleep for better responsiveness
             std::this_thread::sleep_for(std::chrono::microseconds(PipelineConfig::INFERENCE_THREAD_SLEEP_US));
@@ -331,8 +339,6 @@ void Pipeline::displayThread() {
             
             // Create window only once per camera
             if (createdWindows.find(result.second) == createdWindows.end()) {
-                cv::namedWindow(windowName, cv::WINDOW_AUTOSIZE);
-                createdWindows.insert(result.second);
             }
             
             cv::imshow(windowName, result.first);
@@ -346,55 +352,62 @@ void Pipeline::displayThread() {
     }
 }
 
-void Pipeline::processFrame(const CameraFrame& cameraFrame) {
+void Pipeline::processFrame(const CameraFrame& cameraFrame, int threadId) {
     try {
         auto processStart = std::chrono::steady_clock::now();
-        // Use reference to avoid copying - the frame will be moved later
+        
+        // Get thread-specific YOLO instance
+        auto& yolo_instance = yolov11_instances_[threadId];
+        
+        // Use reference to avoid copying
         cv::Mat& frame = const_cast<cv::Mat&>(cameraFrame.frame);
         
         auto preprocessStart = std::chrono::steady_clock::now();
-        // Preprocess the frame
-        yolov11_->preprocess(frame);
+        // Asynchronous preprocessing
+        yolo_instance->preprocessAsync(frame);
         auto preprocessEnd = std::chrono::steady_clock::now();
         
         auto inferenceStart = std::chrono::steady_clock::now();
-        // Perform inference
-        yolov11_->infer();
+        // Asynchronous inference
+        yolo_instance->inferAsync();
         auto inferenceEnd = std::chrono::steady_clock::now();
         
         auto postprocessStart = std::chrono::steady_clock::now();
-        // Postprocess to get detections - preallocate for better performance
+        // Pre-allocate detection vector for better performance
         std::vector<Detection> detections;
         detections.reserve(PipelineConfig::DETECTION_VECTOR_RESERVE);
-        yolov11_->postprocess(detections);
+        
+        // Asynchronous postprocessing
+        yolo_instance->postprocessAsync(detections);
         auto postprocessEnd = std::chrono::steady_clock::now();
         
         // Draw detections on the frame
-        yolov11_->draw(frame, detections);
+        yolo_instance->draw(frame, detections);
         
         auto processEnd = std::chrono::steady_clock::now();
         
-        // Calculate timing
-        auto captureDelay = std::chrono::duration_cast<std::chrono::milliseconds>(processStart - cameraFrame.timestamp).count();
+        // Calculate timing with higher precision
+        auto captureDelay = std::chrono::duration_cast<std::chrono::microseconds>(processStart - cameraFrame.timestamp).count() / 1000.0;
         auto preprocessTime = std::chrono::duration_cast<std::chrono::microseconds>(preprocessEnd - preprocessStart).count() / 1000.0;
         auto inferenceTime = std::chrono::duration_cast<std::chrono::microseconds>(inferenceEnd - inferenceStart).count() / 1000.0;
         auto postprocessTime = std::chrono::duration_cast<std::chrono::microseconds>(postprocessEnd - postprocessStart).count() / 1000.0;
         auto totalProcessTime = std::chrono::duration_cast<std::chrono::microseconds>(processEnd - processStart).count() / 1000.0;
         
-        // Print timing info for each camera
-        std::cout << GREEN_COLOR << "Cam " << cameraFrame.cameraId 
-                  << " - Delay: " << captureDelay << "ms"
-                  << ", Inference: " << std::fixed << std::setprecision(2) << inferenceTime << "ms"
-                  << ", Total: " << totalProcessTime << "ms" 
-                  << ", inference FPS: " << (1000.0 / inferenceTime) << "Hz"
-                  << ", overall FPS: " << (1000.0 / totalProcessTime) << "Hz"
-                  << RESET_COLOR << std::endl;
+        // Print optimized timing info (reduced frequency to avoid spam)
+        static std::atomic<int> frameCounter{0};
+        if (frameCounter.fetch_add(1) % 30 == 0) { // Print every 30th frame
+            std::cout << GREEN_COLOR << "[T" << threadId << "] Cam " << cameraFrame.cameraId 
+                      << " - Latency: " << std::fixed << std::setprecision(1) << captureDelay << "ms"
+                      << ", Inference: " << std::setprecision(2) << inferenceTime << "ms"
+                      << ", Total: " << totalProcessTime << "ms"
+                      << ", FPS: " << (1000.0 / totalProcessTime) << RESET_COLOR << std::endl;
+        }
 
         // Add frame to result queue using move semantics
         pushResult(std::move(frame), cameraFrame.cameraId);
     }
     catch (const std::exception& e) {
-        std::cerr << RED_COLOR << "Error processing frame from camera " 
+        std::cerr << RED_COLOR << "[T" << threadId << "] Error processing frame from camera " 
                   << cameraFrame.cameraId << ": " << e.what() << RESET_COLOR << std::endl;
     }
 }

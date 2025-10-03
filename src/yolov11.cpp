@@ -93,6 +93,11 @@ void YOLOv11::init(std::string engine_path, nvinfer1::ILogger& logger)
     // Create a CUDA stream for asynchronous operations
     CUDA_CHECK(cudaStreamCreate(&stream));
 
+    // Create CUDA events for async operations
+    CUDA_CHECK(cudaEventCreate(&preprocessing_done_));
+    CUDA_CHECK(cudaEventCreate(&inference_done_));
+    events_created_ = true;
+
     // Perform model warmup if enabled
     if (warmup) {
         for (int i = 0; i < 10; i++) {
@@ -108,6 +113,13 @@ YOLOv11::~YOLOv11()
     // Synchronize and destroy the CUDA stream
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaStreamDestroy(stream));
+    
+    // Destroy CUDA events
+    if (events_created_) {
+        CUDA_CHECK(cudaEventDestroy(preprocessing_done_));
+        CUDA_CHECK(cudaEventDestroy(inference_done_));
+    }
+    
     // Free allocated GPU buffers
     for (int i = 0; i < 2; i++)
         CUDA_CHECK(cudaFree(gpu_buffers[i]));
@@ -130,6 +142,19 @@ void YOLOv11::preprocess(Mat& image) {
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
+// Asynchronous preprocessing for better performance
+void YOLOv11::preprocessAsync(Mat& image, cudaStream_t customStream) {
+    cudaStream_t useStream = customStream ? customStream : stream;
+    
+    // Perform CUDA-based preprocessing without synchronization
+    cuda_preprocess(image.ptr(), image.cols, image.rows, gpu_buffers[0], input_w, input_h, useStream);
+    
+    // Record event for async operations
+    if (events_created_) {
+        CUDA_CHECK(cudaEventRecord(preprocessing_done_, useStream));
+    }
+}
+
 // Perform inference using the TensorRT execution context
 void YOLOv11::infer()
 {
@@ -140,6 +165,29 @@ void YOLOv11::infer()
     // For TensorRT versions 10 and above, use enqueueV3 with the CUDA stream
     this->context->enqueueV3(this->stream);
 #endif
+}
+
+// Asynchronous inference for better performance
+void YOLOv11::inferAsync(cudaStream_t customStream) {
+    cudaStream_t useStream = customStream ? customStream : stream;
+    
+    // Ensure preprocessing is complete before inference
+    if (events_created_) {
+        CUDA_CHECK(cudaStreamWaitEvent(useStream, preprocessing_done_, 0));
+    }
+    
+#if NV_TENSORRT_MAJOR < 10
+    // For TensorRT versions less than 10, use enqueueV2 with GPU buffers
+    context->enqueueV2((void**)gpu_buffers, useStream, nullptr);
+#else
+    // For TensorRT versions 10 and above, use enqueueV3 with the CUDA stream
+    this->context->enqueueV3(useStream);
+#endif
+    
+    // Record event for async operations
+    if (events_created_) {
+        CUDA_CHECK(cudaEventRecord(inference_done_, useStream));
+    }
 }
 
 // Postprocess the inference output to extract detections
@@ -201,6 +249,80 @@ void YOLOv11::postprocess(vector<Detection>& output)
         result.conf = confidences[idx];
         result.bbox = boxes[idx];
         output.push_back(result);
+    }
+}
+
+// Asynchronous postprocessing for better performance
+void YOLOv11::postprocessAsync(vector<Detection>& output, cudaStream_t customStream) {
+    cudaStream_t useStream = customStream ? customStream : stream;
+    
+    // Ensure inference is complete before postprocessing
+    if (events_created_) {
+        CUDA_CHECK(cudaStreamWaitEvent(useStream, inference_done_, 0));
+    }
+    
+    // Asynchronously copy output from GPU to CPU
+    CUDA_CHECK(cudaMemcpyAsync(cpu_output_buffer, gpu_buffers[1], 
+                              num_detections * detection_attribute_size * sizeof(float), 
+                              cudaMemcpyDeviceToHost, useStream));
+    
+    // Synchronize only this stream
+    CUDA_CHECK(cudaStreamSynchronize(useStream));
+
+    // Pre-allocate vectors for better performance
+    vector<Rect> boxes;
+    vector<int> class_ids;
+    vector<float> confidences;
+    boxes.reserve(num_detections / 10); // Estimate 10% will pass threshold
+    class_ids.reserve(num_detections / 10);
+    confidences.reserve(num_detections / 10);
+
+    // Create a matrix view of the detection output
+    const Mat det_output(detection_attribute_size, num_detections, CV_32F, cpu_output_buffer);
+
+    // Optimize detection loop
+    for (int i = 0; i < det_output.cols; ++i) {
+        // Extract class scores for the current detection
+        const Mat classes_scores = det_output.col(i).rowRange(4, 4 + num_classes);
+        Point class_id_point;
+        double score;
+        // Find the class with the maximum score
+        minMaxLoc(classes_scores, nullptr, &score, nullptr, &class_id_point);
+
+        // Check if the confidence score exceeds the threshold
+        if (score > conf_threshold) {
+            // Extract bounding box coordinates
+            const float cx = det_output.at<float>(0, i);
+            const float cy = det_output.at<float>(1, i);
+            const float ow = det_output.at<float>(2, i);
+            const float oh = det_output.at<float>(3, i);
+            
+            // Calculate bounding box more efficiently
+            Rect box(static_cast<int>(cx - 0.5f * ow),
+                    static_cast<int>(cy - 0.5f * oh),
+                    static_cast<int>(ow),
+                    static_cast<int>(oh));
+
+            // Store the detection data
+            boxes.emplace_back(box);
+            class_ids.emplace_back(class_id_point.y);
+            confidences.emplace_back(static_cast<float>(score));
+        }
+    }
+
+    // Apply NMS with pre-allocated result vector
+    vector<int> nms_result;
+    nms_result.reserve(boxes.size());
+    dnn::NMSBoxes(boxes, confidences, conf_threshold, nms_threshold, nms_result);
+
+    // Pre-allocate output vector
+    output.clear();
+    output.reserve(nms_result.size());
+
+    // Populate output detections efficiently
+    for (size_t i = 0; i < nms_result.size(); ++i) {
+        int idx = nms_result[i];
+        output.emplace_back(Detection{confidences[idx], class_ids[idx], boxes[idx]});
     }
 }
 
@@ -278,6 +400,53 @@ bool YOLOv11::saveEngine(const std::string& onnxpath)
         delete data;
     }
     return true;
+}
+
+// Create a thread-safe instance for multi-threading
+std::unique_ptr<YOLOv11> YOLOv11::createThreadInstance() {
+    // Create a new instance sharing the same engine
+    auto instance = std::make_unique<YOLOv11>();
+    
+    // Share the engine and runtime (read-only resources)
+    instance->engine = this->engine;
+    instance->runtime = this->runtime;
+    
+    // Create new execution context for this thread
+    instance->context = engine->createExecutionContext();
+    
+    // Copy model parameters
+    instance->input_w = this->input_w;
+    instance->input_h = this->input_h;
+    instance->num_detections = this->num_detections;
+    instance->detection_attribute_size = this->detection_attribute_size;
+    instance->num_classes = this->num_classes;
+    instance->conf_threshold = this->conf_threshold;
+    instance->nms_threshold = this->nms_threshold;
+    
+    // Allocate separate GPU buffers for this thread
+    CUDA_CHECK(cudaMalloc(&instance->gpu_buffers[0], 3 * input_w * input_h * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&instance->gpu_buffers[1], detection_attribute_size * num_detections * sizeof(float)));
+    
+    // Allocate separate CPU buffer
+    instance->cpu_output_buffer = new float[detection_attribute_size * num_detections];
+    
+    // Create separate CUDA stream
+    CUDA_CHECK(cudaStreamCreate(&instance->stream));
+    
+    // Create CUDA events for async operations
+    CUDA_CHECK(cudaEventCreate(&instance->preprocessing_done_));
+    CUDA_CHECK(cudaEventCreate(&instance->inference_done_));
+    instance->events_created_ = true;
+    
+    return instance;
+}
+
+// Check if GPU operations are ready
+bool YOLOv11::isReady() {
+    if (!events_created_) return true;
+    
+    cudaError_t result = cudaEventQuery(inference_done_);
+    return (result == cudaSuccess);
 }
 
 // Draw bounding boxes and labels on the image based on detections

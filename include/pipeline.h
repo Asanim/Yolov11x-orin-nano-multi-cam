@@ -42,7 +42,7 @@ private:
     void displayThread();
     
     // Helper functions
-    void processFrame(const CameraFrame& cameraFrame);
+    void processFrame(const CameraFrame& cameraFrame, int threadId = 0);
     std::string getWindowName(int cameraId);
     
     // Performance optimization functions
@@ -51,6 +51,7 @@ private:
     void optimizeCamera(cv::VideoCapture& cap);
 
     std::unique_ptr<YOLOv11> yolov11_;
+    std::vector<std::unique_ptr<YOLOv11>> yolov11_instances_; // One instance per inference thread
     
     // Threading components - multiple inference threads for parallel processing
     std::vector<std::thread> grabberThreads_;

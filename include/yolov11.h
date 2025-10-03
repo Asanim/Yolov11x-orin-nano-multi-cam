@@ -50,6 +50,11 @@ public:
     YOLOv11(string model_path, nvinfer1::ILogger& logger);
 
     /**
+     * @brief Default constructor for thread instance creation.
+     */
+    YOLOv11() = default;
+
+    /**
      * @brief Destructor to clean up resources.
      *
      * Frees the allocated memory and TensorRT resources.
@@ -91,6 +96,50 @@ public:
      */
     void draw(Mat& image, const vector<Detection>& output);
 
+    /**
+     * @brief Asynchronous preprocessing for better performance.
+     *
+     * @param image The input image to be preprocessed.
+     * @param stream Optional CUDA stream for async operations.
+     */
+    void preprocessAsync(Mat& image, cudaStream_t stream = nullptr);
+
+    /**
+     * @brief Asynchronous inference for better performance.
+     *
+     * @param stream Optional CUDA stream for async operations.
+     */
+    void inferAsync(cudaStream_t stream = nullptr);
+
+    /**
+     * @brief Asynchronous postprocessing for better performance.
+     *
+     * @param output A vector to store the detected objects.
+     * @param stream Optional CUDA stream for async operations.
+     */
+    void postprocessAsync(vector<Detection>& output, cudaStream_t stream = nullptr);
+
+    /**
+     * @brief Get inference context for thread-safe operations.
+     *
+     * @return Execution context pointer.
+     */
+    IExecutionContext* getContext() { return context; }
+
+    /**
+     * @brief Thread-safe clone of the YOLO instance for multi-threading.
+     *
+     * @return A new YOLOv11 instance sharing the same engine.
+     */
+    std::unique_ptr<YOLOv11> createThreadInstance();
+
+    /**
+     * @brief Check if GPU memory operations are complete.
+     *
+     * @return True if all operations are complete.
+     */
+    bool isReady();
+
 private:
     /**
      * @brief Initialize TensorRT components from the given engine file.
@@ -117,6 +166,12 @@ private:
     const int MAX_IMAGE_SIZE = 4096 * 4096; //!< Maximum allowed input image size.
     float conf_threshold = 0.3f; //!< Confidence threshold for filtering detections.
     float nms_threshold = 0.4f; //!< Non-Maximum Suppression (NMS) threshold for filtering overlapping boxes.
+
+    // Multi-threading support
+    std::mutex inference_mutex_; //!< Mutex for thread-safe inference
+    cudaEvent_t preprocessing_done_; //!< CUDA event for async preprocessing
+    cudaEvent_t inference_done_; //!< CUDA event for async inference
+    bool events_created_ = false; //!< Flag to track CUDA event creation
 
     vector<Scalar> colors; //!< A vector of colors for drawing bounding boxes.
 
