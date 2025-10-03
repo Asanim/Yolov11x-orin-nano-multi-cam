@@ -1,6 +1,7 @@
 #include "pipeline.h"
 #include <iostream>
 #include <chrono>
+#include <iomanip>
 
 Pipeline::Pipeline(const std::string& enginePath, nvinfer1::ILogger& logger)
     : running_(false) {
@@ -13,6 +14,8 @@ Pipeline::~Pipeline() {
 
 bool Pipeline::inferImage(const std::string& imagePath) {
     try {
+        auto startTime = std::chrono::high_resolution_clock::now();
+        
         // Read the image
         cv::Mat image = cv::imread(imagePath);
         if (image.empty()) {
@@ -20,15 +23,31 @@ bool Pipeline::inferImage(const std::string& imagePath) {
             return false;
         }
 
+        auto preprocessStart = std::chrono::high_resolution_clock::now();
         // Preprocess the image
         yolov11_->preprocess(image);
+        auto preprocessEnd = std::chrono::high_resolution_clock::now();
 
+        auto inferenceStart = std::chrono::high_resolution_clock::now();
         // Perform inference
         yolov11_->infer();
+        auto inferenceEnd = std::chrono::high_resolution_clock::now();
 
+        auto postprocessStart = std::chrono::high_resolution_clock::now();
         // Postprocess to get detections
         std::vector<Detection> detections;
         yolov11_->postprocess(detections);
+        auto postprocessEnd = std::chrono::high_resolution_clock::now();
+
+        // Calculate timing
+        auto preprocessTime = std::chrono::duration_cast<std::chrono::microseconds>(preprocessEnd - preprocessStart).count() / 1000.0;
+        auto inferenceTime = std::chrono::duration_cast<std::chrono::microseconds>(inferenceEnd - inferenceStart).count() / 1000.0;
+        auto postprocessTime = std::chrono::duration_cast<std::chrono::microseconds>(postprocessEnd - postprocessStart).count() / 1000.0;
+        auto totalTime = std::chrono::duration_cast<std::chrono::microseconds>(postprocessEnd - startTime).count() / 1000.0;
+
+        std::cout << GREEN_COLOR << "Timing Info - Preprocess: " << std::fixed << std::setprecision(2) 
+                  << preprocessTime << "ms, Inference: " << inferenceTime 
+                  << "ms, Postprocess: " << postprocessTime << "ms, Total: " << totalTime << "ms" << RESET_COLOR << std::endl;
 
         // Draw detections on the image
         yolov11_->draw(image, detections);
@@ -68,19 +87,53 @@ bool Pipeline::inferVideo(const std::string& videoPath) {
                              cv::Size(frame_width, frame_height));
 
         cv::Mat frame;
+        int frameCount = 0;
+        auto lastFpsTime = std::chrono::high_resolution_clock::now();
+        
         while (cap.read(frame)) {
+            auto frameStart = std::chrono::high_resolution_clock::now();
+            
+            auto preprocessStart = std::chrono::high_resolution_clock::now();
             // Preprocess the frame
             yolov11_->preprocess(frame);
+            auto preprocessEnd = std::chrono::high_resolution_clock::now();
 
+            auto inferenceStart = std::chrono::high_resolution_clock::now();
             // Perform inference
             yolov11_->infer();
+            auto inferenceEnd = std::chrono::high_resolution_clock::now();
 
+            auto postprocessStart = std::chrono::high_resolution_clock::now();
             // Postprocess to get detections
             std::vector<Detection> detections;
             yolov11_->postprocess(detections);
+            auto postprocessEnd = std::chrono::high_resolution_clock::now();
 
             // Draw detections on the frame
             yolov11_->draw(frame, detections);
+
+            auto frameEnd = std::chrono::high_resolution_clock::now();
+            
+            // Calculate timing for this frame
+            auto preprocessTime = std::chrono::duration_cast<std::chrono::microseconds>(preprocessEnd - preprocessStart).count() / 1000.0;
+            auto inferenceTime = std::chrono::duration_cast<std::chrono::microseconds>(inferenceEnd - inferenceStart).count() / 1000.0;
+            auto postprocessTime = std::chrono::duration_cast<std::chrono::microseconds>(postprocessEnd - postprocessStart).count() / 1000.0;
+            auto totalFrameTime = std::chrono::duration_cast<std::chrono::microseconds>(frameEnd - frameStart).count() / 1000.0;
+            
+            frameCount++;
+            
+            // Calculate FPS every 30 frames
+            if (frameCount % 30 == 0) {
+                auto currentTime = std::chrono::high_resolution_clock::now();
+                auto timeDiff = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - lastFpsTime).count();
+                double fps = 30000.0 / timeDiff;
+                
+                std::cout << GREEN_COLOR << "Frame " << frameCount << " - FPS: " << std::fixed << std::setprecision(1) << fps
+                          << ", Inference: " << std::setprecision(2) << inferenceTime << "ms"
+                          << ", Total: " << totalFrameTime << "ms" << RESET_COLOR << std::endl;
+                
+                lastFpsTime = currentTime;
+            }
 
             // Display the frame
             cv::imshow("Inference", frame);
@@ -279,20 +332,42 @@ void Pipeline::displayThread() {
 
 void Pipeline::processFrame(const CameraFrame& cameraFrame) {
     try {
+        auto processStart = std::chrono::steady_clock::now();
         cv::Mat frame = cameraFrame.frame.clone();
         
+        auto preprocessStart = std::chrono::steady_clock::now();
         // Preprocess the frame
         yolov11_->preprocess(frame);
+        auto preprocessEnd = std::chrono::steady_clock::now();
         
+        auto inferenceStart = std::chrono::steady_clock::now();
         // Perform inference
         yolov11_->infer();
+        auto inferenceEnd = std::chrono::steady_clock::now();
         
+        auto postprocessStart = std::chrono::steady_clock::now();
         // Postprocess to get detections
         std::vector<Detection> detections;
         yolov11_->postprocess(detections);
+        auto postprocessEnd = std::chrono::steady_clock::now();
         
         // Draw detections on the frame
         yolov11_->draw(frame, detections);
+        
+        auto processEnd = std::chrono::steady_clock::now();
+        
+        // Calculate timing
+        auto captureDelay = std::chrono::duration_cast<std::chrono::milliseconds>(processStart - cameraFrame.timestamp).count();
+        auto preprocessTime = std::chrono::duration_cast<std::chrono::microseconds>(preprocessEnd - preprocessStart).count() / 1000.0;
+        auto inferenceTime = std::chrono::duration_cast<std::chrono::microseconds>(inferenceEnd - inferenceStart).count() / 1000.0;
+        auto postprocessTime = std::chrono::duration_cast<std::chrono::microseconds>(postprocessEnd - postprocessStart).count() / 1000.0;
+        auto totalProcessTime = std::chrono::duration_cast<std::chrono::microseconds>(processEnd - processStart).count() / 1000.0;
+        
+        // Print timing info for each camera
+        std::cout << GREEN_COLOR << "Cam " << cameraFrame.cameraId 
+                  << " - Delay: " << captureDelay << "ms"
+                  << ", Inference: " << std::fixed << std::setprecision(2) << inferenceTime << "ms"
+                  << ", Total: " << totalProcessTime << "ms" << RESET_COLOR << std::endl;
         
         // Add frame to result queue
         {
