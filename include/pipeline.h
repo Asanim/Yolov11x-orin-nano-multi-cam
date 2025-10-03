@@ -151,6 +151,7 @@ private:
     
     // Camera management
     std::vector<cv::VideoCapture> cameras_;
+    std::vector<int> cameraIds_;  // Maps camera vector index to camera ID
     
     // === Performance Monitoring ===
     std::atomic<uint64_t> totalFramesProcessed_{0};

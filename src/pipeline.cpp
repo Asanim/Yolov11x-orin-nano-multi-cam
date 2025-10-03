@@ -312,14 +312,28 @@ void Pipeline::frameGrabberThread(int cameraId, int targetFps) {
     auto frameDuration = std::chrono::milliseconds(1000 / targetFps);
     auto nextFrameTime = std::chrono::steady_clock::now();
     
-    // Find the camera index in our cameras vector
-    size_t cameraIndex = 0;
+    // Find the camera index in our cameras vector based on the camera ID
+    size_t cameraIndex = static_cast<size_t>(-1); // Invalid index initially
+    
+    // Map camera ID to camera index in our vector
+    // This assumes cameraId corresponds to the order cameras were added
     for (size_t i = 0; i < cameras_.size(); ++i) {
-        // This is a simplified approach - in practice you'd want to track camera IDs better
+        // For now, use simple mapping: first camera in vector = first cameraId passed
+        // A better approach would be to store camera ID mapping
         if (i < cameras_.size()) {
             cameraIndex = i;
             break;
         }
+    }
+    
+    // Better approach: use a static counter to assign unique indices
+    static std::atomic<size_t> threadCounter{0};
+    cameraIndex = threadCounter.fetch_add(1);
+    
+    if (cameraIndex >= cameras_.size()) {
+        std::cerr << RED_COLOR << "Invalid camera index " << cameraIndex 
+                  << " for camera ID " << cameraId << RESET_COLOR << std::endl;
+        return;
     }
     
     while (running_) {
